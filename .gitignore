@@ -1,0 +1,50 @@
+# Build directories
+build/
+bin/
+lib/
+
+# Compiled object files
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+*.a
+
+# Executables
+FluidSimulation
+*.exe
+*.out
+*.app
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+*.cmake
+!CMakeLists.txt
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug files
+*.dSYM/
+*.pdb
+*.ilk
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Log files
+*.log
+
+# Package manager
+vcpkg_installed/

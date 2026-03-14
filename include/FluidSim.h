@@ -126,7 +126,7 @@ public:
     
     /**
      * Main simulation step.
-     * @param dt Timestep in seconds (computed from frame time)
+     * Timestep in seconds (computed from frame time)
      */
     void step(float dt);
     

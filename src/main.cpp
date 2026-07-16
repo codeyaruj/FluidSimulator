@@ -1,21 +1,34 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
+#include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <iomanip>
 #include "FluidSim.h"
 #include "Renderer.h"
+#include "SimulationUtils.h"
 
 // Global state
 std::unique_ptr<FluidSim> g_fluidSim;
 std::unique_ptr<Renderer> g_renderer;
+bool g_resetRequested = false;
 int g_windowWidth = 800;
 int g_windowHeight = 800;
+int g_framebufferWidth = 800;
+int g_framebufferHeight = 800;
 
 // Mouse interaction state
-bool g_leftMousePressed = false;
-double g_prevMouseX = 0.0;
-double g_prevMouseY = 0.0;
+struct MouseInputState {
+    bool leftPressed = false;
+    bool hasCursorPosition = false;
+    double cursorX = 0.0;
+    double cursorY = 0.0;
+    double accumulatedDeltaX = 0.0;
+    double accumulatedDeltaY = 0.0;
+};
+
+MouseInputState g_mouseInput;
 
 // Timing for dynamic timestep
 double g_lastFrameTime = 0.0;
@@ -30,70 +43,92 @@ void printModeHelp() {
     std::cout << "3 - Vorticity (rotation detection)" << std::endl;
 }
 
-/**
- * Convert screen coordinates to grid coordinates.
- * Handles coordinate system transformation (screen Y is inverted).
- */
-void screenToGrid(double screenX, double screenY, int& gridX, int& gridY) {
-    gridX = static_cast<int>((screenX / g_windowWidth) * GRID_SIZE);
-    gridY = static_cast<int>(((g_windowHeight - screenY) / g_windowHeight) * GRID_SIZE);
-}
-
 void errorCallback(int error, const char* description) {
     std::cerr << "GLFW Error " << error << ": " << description << std::endl;
 }
 
 void framebufferSizeCallback(GLFWwindow* /*window*/, int width, int height) {
+    g_framebufferWidth = width;
+    g_framebufferHeight = height;
+    glViewport(0, 0, width, height);
+}
+
+void windowSizeCallback(GLFWwindow* /*window*/, int width, int height) {
     g_windowWidth = width;
     g_windowHeight = height;
-    glViewport(0, 0, width, height);
-    if (g_renderer) {
-        g_renderer->setWindowSize(width, height);
-    }
 }
 
-void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
+void mouseButtonCallback(GLFWwindow* window, int button, int action, int /*mods*/) {
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
         if (action == GLFW_PRESS) {
-            g_leftMousePressed = true;
+            g_mouseInput.leftPressed = true;
             double xpos, ypos;
             glfwGetCursorPos(window, &xpos, &ypos);
-            g_prevMouseX = xpos;
-            g_prevMouseY = ypos;
+            if (std::isfinite(xpos) && std::isfinite(ypos)) {
+                g_mouseInput.hasCursorPosition = true;
+                g_mouseInput.cursorX = xpos;
+                g_mouseInput.cursorY = ypos;
+            }
+            g_mouseInput.accumulatedDeltaX = 0.0;
+            g_mouseInput.accumulatedDeltaY = 0.0;
         } else if (action == GLFW_RELEASE) {
-            g_leftMousePressed = false;
+            g_mouseInput.leftPressed = false;
         }
     }
 }
 
-void cursorPositionCallback(GLFWwindow* window, double xpos, double ypos) {
-    if (g_fluidSim) {
-        int gridX, gridY;
-        screenToGrid(xpos, ypos, gridX, gridY);
-        
-        // Left-click: add fluid and velocity
-        if (g_leftMousePressed) {
-            // Calculate mouse velocity for fluid injection
-            float dx = static_cast<float>(xpos - g_prevMouseX);
-            float dy = static_cast<float>(ypos - g_prevMouseY);
-            
-            // Add density (dye) at cursor
-            g_fluidSim->addDensity(gridX, gridY, 200.0f);
-            
-            // Add velocity based on mouse movement
-            g_fluidSim->addVelocity(gridX, gridY, dx * 5.0f, -dy * 5.0f);
-            
-            // Add in a small radius for better visuals
-            for (int i = -1; i <= 1; i++) {
-                for (int j = -1; j <= 1; j++) {
-                    g_fluidSim->addDensity(gridX + i, gridY + j, 100.0f);
-                    g_fluidSim->addVelocity(gridX + i, gridY + j, dx * 5.0f, -dy * 5.0f);
-                }
-            }
-            
-            g_prevMouseX = xpos;
-            g_prevMouseY = ypos;
-        }
+void cursorPositionCallback(GLFWwindow* /*window*/, double xpos, double ypos) {
+    if (!std::isfinite(xpos) || !std::isfinite(ypos)) {
+        return;
+    }
+
+    if (g_mouseInput.leftPressed && g_mouseInput.hasCursorPosition) {
+        g_mouseInput.accumulatedDeltaX += xpos - g_mouseInput.cursorX;
+        g_mouseInput.accumulatedDeltaY += ypos - g_mouseInput.cursorY;
+    }
+
+    g_mouseInput.hasCursorPosition = true;
+    g_mouseInput.cursorX = xpos;
+    g_mouseInput.cursorY = ypos;
+}
+
+void applyMouseInput(float rawDt, float simulationDt) {
+    double pendingDeltaX = g_mouseInput.accumulatedDeltaX;
+    double pendingDeltaY = g_mouseInput.accumulatedDeltaY;
+    g_mouseInput.accumulatedDeltaX = 0.0;
+    g_mouseInput.accumulatedDeltaY = 0.0;
+
+    if (!std::isfinite(pendingDeltaX) || !std::isfinite(pendingDeltaY)) {
+        pendingDeltaX = 0.0;
+        pendingDeltaY = 0.0;
+    }
+
+    if (!g_fluidSim || !g_mouseInput.hasCursorPosition ||
+        simulationDt <= 0.0f || !std::isfinite(rawDt) || rawDt <= 0.0f) {
+        return;
+    }
+
+    GridCoordinate gridPosition;
+    if (!mapWindowToGrid(g_mouseInput.cursorX, g_mouseInput.cursorY,
+                         g_windowWidth, g_windowHeight, GRID_SIZE,
+                         gridPosition)) {
+        return;
+    }
+
+    float velocityRateX = 0.0f;
+    float velocityRateY = 0.0f;
+    const bool hasVelocityRate = calculatePointerVelocityRate(
+        pendingDeltaX, pendingDeltaY, g_windowWidth, g_windowHeight, rawDt,
+        MOUSE_VELOCITY_COUPLING, MAX_NORMALIZED_MOUSE_SPEED,
+        velocityRateX, velocityRateY);
+
+    if (g_mouseInput.leftPressed) {
+        applyDensityBrush(*g_fluidSim, gridPosition, simulationDt);
+    }
+
+    if (hasVelocityRate && (pendingDeltaX != 0.0 || pendingDeltaY != 0.0)) {
+        applyVelocityBrush(*g_fluidSim, gridPosition, velocityRateX,
+                           velocityRateY, simulationDt);
     }
 }
 
@@ -106,11 +141,8 @@ void keyCallback(GLFWwindow* window, int key, int /*scancode*/, int action, int 
             break;
             
         case GLFW_KEY_R:
-            // Reset simulation
-            if (g_fluidSim) {
-                g_fluidSim = std::make_unique<FluidSim>(DIFFUSION, VISCOSITY);
-                std::cout << "Simulation reset!" << std::endl;
-            }
+            // Defer allocation so exceptions remain inside main's try/catch.
+            g_resetRequested = true;
             break;
             
         // Visualization mode keys
@@ -153,7 +185,7 @@ int main() {
     // Initialize GLFW
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
-        return -1;
+        return EXIT_FAILURE;
     }
     
     glfwSetErrorCallback(errorCallback);
@@ -173,10 +205,11 @@ int main() {
     if (!window) {
         std::cerr << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
-        return -1;
+        return EXIT_FAILURE;
     }
     
     glfwMakeContextCurrent(window);
+    glfwSetWindowSizeCallback(window, windowSizeCallback);
     glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
     glfwSetMouseButtonCallback(window, mouseButtonCallback);
     glfwSetCursorPosCallback(window, cursorPositionCallback);
@@ -186,11 +219,19 @@ int main() {
     glewExperimental = GL_TRUE;
     if (glewInit() != GLEW_OK) {
         std::cerr << "Failed to initialize GLEW" << std::endl;
-        return -1;
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return EXIT_FAILURE;
     }
+
+    // GLEW may leave a benign GL_INVALID_ENUM on core-profile contexts.
+    while (glGetError() != GL_NO_ERROR) {}
+
+    glfwGetWindowSize(window, &g_windowWidth, &g_windowHeight);
+    glfwGetFramebufferSize(window, &g_framebufferWidth, &g_framebufferHeight);
     
     // Set viewport
-    glViewport(0, 0, g_windowWidth, g_windowHeight);
+    glViewport(0, 0, g_framebufferWidth, g_framebufferHeight);
     
     // Enable vsync for consistent frame rate
     glfwSwapInterval(1);
@@ -202,6 +243,9 @@ int main() {
     std::cout << "OpenGL Version: " << glGetString(GL_VERSION) << std::endl;
     std::cout << "GLSL Version: " << glGetString(GL_SHADING_LANGUAGE_VERSION) << std::endl;
     std::cout << "\nGrid Size: " << GRID_SIZE << "x" << GRID_SIZE << std::endl;
+    std::cout << "Window Size: " << g_windowWidth << "x" << g_windowHeight << std::endl;
+    std::cout << "Framebuffer Size: " << g_framebufferWidth << "x"
+              << g_framebufferHeight << std::endl;
     std::cout << "Viscosity: " << VISCOSITY << std::endl;
     std::cout << "Diffusion: " << DIFFUSION << std::endl;
     
@@ -215,40 +259,55 @@ int main() {
     
     printModeHelp();
     
-    // Initialize simulation and renderer
-    g_fluidSim = std::make_unique<FluidSim>(DIFFUSION, VISCOSITY);
-    g_renderer = std::make_unique<Renderer>(GRID_SIZE, g_windowWidth, g_windowHeight);
-    
-    // Timing variables
-    g_lastFrameTime = glfwGetTime();
-    double lastFPSTime = glfwGetTime();
-    int frameCount = 0;
-    
-    // Main loop
-    while (!glfwWindowShouldClose(window)) {
-        // Calculate delta time for dynamic timestep
-        double currentTime = glfwGetTime();
-        float dt = static_cast<float>(currentTime - g_lastFrameTime);
-        g_lastFrameTime = currentTime;
-        
-        // FPS counter
-        frameCount++;
-        if (currentTime - lastFPSTime >= 1.0) {
-            std::cout << "FPS: " << frameCount << " | dt: " << std::fixed 
-                      << std::setprecision(2) << (dt * 1000.0f) << "ms" << std::endl;
-            frameCount = 0;
-            lastFPSTime = currentTime;
+    int exitStatus = EXIT_SUCCESS;
+    try {
+        // Initialize simulation and renderer while the OpenGL context is current.
+        g_fluidSim = std::make_unique<FluidSim>(DIFFUSION, VISCOSITY);
+        g_renderer = std::make_unique<Renderer>(GRID_SIZE);
+
+        g_lastFrameTime = glfwGetTime();
+        double lastFPSTime = glfwGetTime();
+        int frameCount = 0;
+
+        while (!glfwWindowShouldClose(window)) {
+            // Poll first so all cursor events are accumulated once per update.
+            glfwPollEvents();
+            if (glfwWindowShouldClose(window)) {
+                break;
+            }
+
+            const double currentTime = glfwGetTime();
+            const float rawDt = static_cast<float>(currentTime - g_lastFrameTime);
+            const float simulationDt = FluidSim::sanitizeTimestep(rawDt);
+            g_lastFrameTime = currentTime;
+
+            frameCount++;
+            if (currentTime - lastFPSTime >= 1.0) {
+                std::cout << "FPS: " << frameCount << " | dt: " << std::fixed
+                          << std::setprecision(2) << (simulationDt * 1000.0f)
+                          << "ms" << std::endl;
+                frameCount = 0;
+                lastFPSTime = currentTime;
+            }
+
+            if (g_resetRequested) {
+                g_fluidSim = std::make_unique<FluidSim>(DIFFUSION, VISCOSITY);
+                g_resetRequested = false;
+                std::cout << "Simulation reset!" << std::endl;
+            }
+
+            applyMouseInput(rawDt, simulationDt);
+            g_fluidSim->step(simulationDt);
+            g_renderer->draw(*g_fluidSim);
+            glfwSwapBuffers(window);
         }
-        
-        // Update simulation with dynamic timestep
-        g_fluidSim->step(dt);
-        
-        // Render with current visualization mode
-        g_renderer->draw(*g_fluidSim);
-        
-        // Swap buffers and poll events
-        glfwSwapBuffers(window);
-        glfwPollEvents();
+    } catch (const std::exception& error) {
+        std::cerr << "Fatal initialization or rendering error:\n"
+                  << error.what() << std::endl;
+        exitStatus = EXIT_FAILURE;
+    } catch (...) {
+        std::cerr << "Fatal unknown initialization or rendering error" << std::endl;
+        exitStatus = EXIT_FAILURE;
     }
     
     // Cleanup
@@ -258,5 +317,5 @@ int main() {
     glfwDestroyWindow(window);
     glfwTerminate();
     
-    return 0;
+    return exitStatus;
 }

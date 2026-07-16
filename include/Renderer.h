@@ -4,6 +4,7 @@
 #include <GL/glew.h>
 #include <vector>
 #include "FluidSim.h"
+#include "SimulationUtils.h"
 
 /**
  * Visualization modes for inspecting simulation internals.
@@ -32,10 +33,6 @@ private:
     // Current render mode
     RenderMode currentMode;
     
-    // Window dimensions for coordinate mapping
-    int windowWidth;
-    int windowHeight;
-    
     // Shader compilation helper
     GLuint compileShader(const char* source, GLenum type);
     GLuint createShaderProgram(const char* vertexSrc, const char* fragmentSrc);
@@ -44,22 +41,22 @@ private:
     void initBuffers();
     void initTexture();
     void initShaders();
+    void releaseResources() noexcept;
+    void updateTexture(const std::vector<float>& data, TextureFieldKind kind);
 
 public:
-    Renderer(int size, int windowW, int windowH);
+    explicit Renderer(int size);
     ~Renderer();
-    
+    Renderer(const Renderer&) = delete;
+    Renderer& operator=(const Renderer&) = delete;
+    Renderer(Renderer&&) = delete;
+    Renderer& operator=(Renderer&&) = delete;
+
     /**
      * Main draw function - renders fluid based on current mode.
      * @param fluid Reference to the fluid simulation
      */
     void draw(const FluidSim& fluid);
-    
-    /**
-     * Update texture with scalar field data.
-     * Handles different data ranges via min/max normalization.
-     */
-    void updateTexture(const std::vector<float>& data, float minVal = 0.0f, float maxVal = 1.0f);
     
     /**
      * Set the visualization mode.
@@ -72,10 +69,6 @@ public:
      */
     void nextRenderMode();
     
-    /**
-     * Update window dimensions (e.g., on resize).
-     */
-    void setWindowSize(int w, int h) { windowWidth = w; windowHeight = h; }
 };
 
 #endif // RENDERER_H

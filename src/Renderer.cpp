@@ -1,8 +1,9 @@
 #include "Renderer.h"
-#include <iostream>
-#include <cstring>
-#include <cmath>
 #include <algorithm>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 // ============================================================================
 // SHADER SOURCES
@@ -30,8 +31,7 @@ void main() {
  * 
  * Different color mappings for different visualization modes:
  * - DENSITY: Black → Blue → Cyan → Yellow → White
- * - DIVERGENCE: Black (zero) → White (divergence)
- * - VORTICITY: Blue (clockwise) → Black → Red (counter-clockwise)
+ * - DIVERGENCE/VORTICITY: Blue (negative) → Black → Red (positive)
  */
 const char* fragmentShaderSource = R"(
 #version 330 core
@@ -60,16 +60,13 @@ void main() {
             float t = (value - 0.8) / 0.2;
             color = vec3(1.0, 1.0, t);
         }
-    } else if (renderMode == 1) {
-        // DIVERGENCE: Black → White (grayscale)
-        float absDiv = abs(value);
-        color = vec3(absDiv, absDiv, absDiv);
-    } else if (renderMode == 2) {
-        // VORTICITY: Blue (clockwise) → Black → Red (counter-clockwise)
+    } else if (renderMode == 1 || renderMode == 2) {
+        // SIGNED FIELDS: Blue (negative) → Black (zero) → Red (positive)
+        float magnitude = abs(value);
         if (value < 0.0) {
-            color = vec3(0.0, 0.0, -value);
+            color = vec3(0.0, 0.0, magnitude);
         } else {
-            color = vec3(value, 0.0, 0.0);
+            color = vec3(magnitude, 0.0, 0.0);
         }
     } else {
         color = vec3(value, value, value);
@@ -79,23 +76,59 @@ void main() {
 }
 )";
 
+namespace {
+
+void throwOnOpenGLError(const char* operation) {
+    const GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+        std::ostringstream message;
+        message << operation << " failed with OpenGL error 0x"
+                << std::hex << error;
+        throw std::runtime_error(message.str());
+    }
+}
+
+} // namespace
+
 // ============================================================================
 // CONSTRUCTOR / DESTRUCTOR
 // ============================================================================
 
-Renderer::Renderer(int size, int windowW, int windowH)
-    : gridSize(size), currentMode(RenderMode::DENSITY), 
-      windowWidth(windowW), windowHeight(windowH) {
-    initShaders();
-    initBuffers();
-    initTexture();
+Renderer::Renderer(int size)
+    : shaderProgram(0), VAO(0), VBO(0), texture(0), gridSize(size),
+      currentMode(RenderMode::DENSITY) {
+    checkedGridElementCount(gridSize);
+    try {
+        initShaders();
+        initBuffers();
+        initTexture();
+    } catch (...) {
+        releaseResources();
+        throw;
+    }
 }
 
 Renderer::~Renderer() {
-    glDeleteVertexArrays(1, &VAO);
-    glDeleteBuffers(1, &VBO);
-    glDeleteTextures(1, &texture);
-    glDeleteProgram(shaderProgram);
+    releaseResources();
+}
+
+void Renderer::releaseResources() noexcept {
+    if (texture != 0) {
+        glDeleteTextures(1, &texture);
+        texture = 0;
+    }
+    if (VBO != 0) {
+        glDeleteBuffers(1, &VBO);
+        VBO = 0;
+    }
+    if (VAO != 0) {
+        glDeleteVertexArrays(1, &VAO);
+        VAO = 0;
+    }
+    if (shaderProgram != 0) {
+        glDeleteProgram(shaderProgram);
+        shaderProgram = 0;
+    }
 }
 
 // ============================================================================
@@ -104,41 +137,85 @@ Renderer::~Renderer() {
 
 GLuint Renderer::compileShader(const char* source, GLenum type) {
     GLuint shader = glCreateShader(type);
+    if (shader == 0) {
+        throw std::runtime_error("OpenGL failed to create a shader object");
+    }
+
     glShaderSource(shader, 1, &source, nullptr);
     glCompileShader(shader);
     
     GLint success;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
     if (!success) {
-        char infoLog[512];
-        glGetShaderInfoLog(shader, 512, nullptr, infoLog);
-        std::cerr << "Shader compilation failed:\n" << infoLog << std::endl;
+        std::string detail;
+        try {
+            GLint logLength = 0;
+            glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLength);
+            std::vector<char> log(
+                static_cast<std::size_t>(std::max(1, logLength)), '\0');
+            GLsizei written = 0;
+            glGetShaderInfoLog(shader, static_cast<GLsizei>(log.size()),
+                               &written, log.data());
+            detail.assign(log.data(),
+                          static_cast<std::size_t>(std::max(0, written)));
+        } catch (...) {
+            glDeleteShader(shader);
+            throw;
+        }
+        glDeleteShader(shader);
+        throw std::runtime_error("Shader compilation failed:\n" + detail);
     }
     
     return shader;
 }
 
 GLuint Renderer::createShaderProgram(const char* vertexSrc, const char* fragmentSrc) {
-    GLuint vertexShader = compileShader(vertexSrc, GL_VERTEX_SHADER);
-    GLuint fragmentShader = compileShader(fragmentSrc, GL_FRAGMENT_SHADER);
-    
-    GLuint program = glCreateProgram();
-    glAttachShader(program, vertexShader);
-    glAttachShader(program, fragmentShader);
-    glLinkProgram(program);
-    
-    GLint success;
-    glGetProgramiv(program, GL_LINK_STATUS, &success);
-    if (!success) {
-        char infoLog[512];
-        glGetProgramInfoLog(program, 512, nullptr, infoLog);
-        std::cerr << "Shader program linking failed:\n" << infoLog << std::endl;
+    GLuint vertexShader = 0;
+    GLuint fragmentShader = 0;
+    GLuint program = 0;
+
+    try {
+        vertexShader = compileShader(vertexSrc, GL_VERTEX_SHADER);
+        fragmentShader = compileShader(fragmentSrc, GL_FRAGMENT_SHADER);
+
+        program = glCreateProgram();
+        if (program == 0) {
+            throw std::runtime_error("OpenGL failed to create a shader program");
+        }
+
+        glAttachShader(program, vertexShader);
+        glAttachShader(program, fragmentShader);
+        glLinkProgram(program);
+
+        GLint success = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &success);
+        if (!success) {
+            GLint logLength = 0;
+            glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength);
+            std::vector<char> log(static_cast<std::size_t>(std::max(1, logLength)), '\0');
+            GLsizei written = 0;
+            glGetProgramInfoLog(program, static_cast<GLsizei>(log.size()),
+                                &written, log.data());
+            const std::string detail(
+                log.data(), static_cast<std::size_t>(std::max(0, written)));
+            throw std::runtime_error("Shader program linking failed:\n" + detail);
+        }
+
+        glDeleteShader(vertexShader);
+        glDeleteShader(fragmentShader);
+        return program;
+    } catch (...) {
+        if (program != 0) {
+            glDeleteProgram(program);
+        }
+        if (fragmentShader != 0) {
+            glDeleteShader(fragmentShader);
+        }
+        if (vertexShader != 0) {
+            glDeleteShader(vertexShader);
+        }
+        throw;
     }
-    
-    glDeleteShader(vertexShader);
-    glDeleteShader(fragmentShader);
-    
-    return program;
 }
 
 void Renderer::initShaders() {
@@ -163,6 +240,9 @@ void Renderer::initBuffers() {
     
     glGenVertexArrays(1, &VAO);
     glGenBuffers(1, &VBO);
+    if (VAO == 0 || VBO == 0) {
+        throw std::runtime_error("OpenGL failed to allocate renderer buffers");
+    }
     
     glBindVertexArray(VAO);
     
@@ -179,10 +259,14 @@ void Renderer::initBuffers() {
     
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
+    throwOnOpenGLError("Renderer buffer initialization");
 }
 
 void Renderer::initTexture() {
     glGenTextures(1, &texture);
+    if (texture == 0) {
+        throw std::runtime_error("OpenGL failed to allocate the scalar-field texture");
+    }
     glBindTexture(GL_TEXTURE_2D, texture);
     
     // Set texture parameters
@@ -195,27 +279,22 @@ void Renderer::initTexture() {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, gridSize, gridSize, 0, GL_RED, GL_FLOAT, nullptr);
     
     glBindTexture(GL_TEXTURE_2D, 0);
+    throwOnOpenGLError("Renderer texture initialization");
 }
 
 // ============================================================================
 // TEXTURE UPDATE
 // ============================================================================
 
-void Renderer::updateTexture(const std::vector<float>& data, float minVal, float maxVal) {
-    // Normalize data to [0, 1] range for visualization
-    std::vector<float> normalized(data.size());
-    float range = maxVal - minVal;
-    if (range < 0.0001f) range = 1.0f;  // Avoid division by zero
-    
-    for (size_t i = 0; i < data.size(); i++) {
-        normalized[i] = (data[i] - minVal) / range;
-        // Clamp to [0, 1]
-        normalized[i] = std::max(0.0f, std::min(1.0f, normalized[i]));
-    }
-    
+void Renderer::updateTexture(const std::vector<float>& data, TextureFieldKind kind) {
+    // Preparation validates the exact buffer size before any OpenGL call.
+    const std::vector<float> prepared = prepareTextureData(data, gridSize, kind);
+
     glBindTexture(GL_TEXTURE_2D, texture);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gridSize, gridSize, GL_RED, GL_FLOAT, normalized.data());
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gridSize, gridSize,
+                    GL_RED, GL_FLOAT, prepared.data());
     glBindTexture(GL_TEXTURE_2D, 0);
+    throwOnOpenGLError("Scalar-field texture upload");
 }
 
 // ============================================================================
@@ -225,32 +304,25 @@ void Renderer::updateTexture(const std::vector<float>& data, float minVal, float
 void Renderer::draw(const FluidSim& fluid) {
     // Get appropriate data based on render mode
     const std::vector<float>* data = nullptr;
-    float minVal = 0.0f, maxVal = 1.0f;
+    TextureFieldKind kind = TextureFieldKind::DENSITY;
     
     switch (currentMode) {
         case RenderMode::DENSITY:
             data = &fluid.getDensity();
-            minVal = 0.0f;
-            maxVal = 1.0f;
             break;
         case RenderMode::DIVERGENCE:
             data = &fluid.getDivergence();
-            maxVal = *std::max_element(data->begin(), data->end());
-            maxVal = std::max(0.001f, std::abs(maxVal));
-            minVal = -maxVal;
+            kind = TextureFieldKind::SIGNED;
             break;
         case RenderMode::VORTICITY:
             data = &fluid.getVorticity();
-            maxVal = *std::max_element(data->begin(), data->end());
-            maxVal = std::max(0.001f, std::abs(maxVal));
-            minVal = -maxVal;
+            kind = TextureFieldKind::SIGNED;
             break;
     }
     
     if (!data) return;
     
-    // Update texture with normalized data
-    updateTexture(*data, minVal, maxVal);
+    updateTexture(*data, kind);
     
     // Clear screen
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);

@@ -3,7 +3,7 @@
 A real-time 2D fluid simulation built using C++ and OpenGL. This project implements a grid-based (Eulerian) physics model to simulate the behavior of fluids like smoke or water with interactive user input.
 
 ![Fluid Simulation](https://img.shields.io/badge/OpenGL-3.3-blue)
-![C++](https://img.shields.io/badge/C++-11-orange)
+![C++](https://img.shields.io/badge/C++-14-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## Features
@@ -57,11 +57,15 @@ Where:
 fluid_simulation/
 ├── include/
 │   ├── FluidSim.h       # Fluid physics engine header
-│   └── Renderer.h       # OpenGL renderer header
+│   ├── Renderer.h       # OpenGL renderer header
+│   └── SimulationUtils.h  # Headless coordinate/texture helpers
 ├── src/
 │   ├── main.cpp         # Application entry point
 │   ├── FluidSim.cpp     # Physics implementation
-│   └── Renderer.cpp     # Rendering implementation
+│   ├── Renderer.cpp     # Rendering implementation
+│   └── SimulationUtils.cpp
+├── tests/
+│   └── FluidSimulationTests.cpp
 ├── CMakeLists.txt       # Build configuration
 └── README.md           # This file
 ```
@@ -71,14 +75,14 @@ fluid_simulation/
 - **OpenGL 3.3+**: Graphics API
 - **GLFW 3**: Window management and input handling
 - **GLEW**: OpenGL extension loader
-- **C++11** or later
+- A **C++14** compiler or later (`std::make_unique` is used)
+- **CMake 3.20** or later
 
 ### Ubuntu/Debian Installation
 
 ```bash
 sudo apt-get update
-sudo apt-get install build-essential cmake
-sudo apt-get install libglfw3-dev libglew-dev libgl1-mesa-dev
+sudo apt-get install build-essential cmake libglfw3-dev libglew-dev libgl1-mesa-dev
 ```
 
 ### macOS Installation
@@ -89,40 +93,92 @@ brew install cmake glfw glew
 
 ### Windows Installation
 
-Use [vcpkg](https://vcpkg.io/) or download pre-built libraries:
-```bash
+Use [vcpkg](https://vcpkg.io/) or download the libraries manually:
+```powershell
 vcpkg install glfw3 glew opengl
+```
+
+When configuring with vcpkg, pass its CMake toolchain file, for example:
+
+```powershell
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Debug --parallel
+ctest --test-dir build -C Debug --output-on-failure
+.\build\Debug\FluidSimulation.exe
 ```
 
 ## Building the Project
 
 ### Using CMake
 
-```bash
-# Create build directory
-mkdir build
-cd build
+For single-configuration generators such as Makefiles or Ninja:
 
-# Configure and build
-cmake ..
-make
+```bash
+# From the repository root
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --parallel
 
 # Run the simulation
-./FluidSimulation
+./build/FluidSimulation
 ```
 
 ### Build Types
 
-**Debug build** (with debug symbols):
+**Release build:**
+
 ```bash
-cmake -DCMAKE_BUILD_TYPE=Debug ..
-make
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --parallel
 ```
 
-**Release build** (optimized):
+### Tests
+
+Tests are enabled by default through CTest and do not open a GLFW window or
+require a graphical display:
+
 ```bash
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+Set `-DBUILD_TESTING=OFF` when an application-only build is desired.
+
+For a graphics-dependency-free CI build, disable the application. This builds
+and runs the solver/helper tests without finding or linking OpenGL, GLEW, or
+GLFW:
+
+```bash
+cmake -S . -B build-headless \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DFLUIDSIM_BUILD_APP=OFF
+cmake --build build-headless --parallel
+ctest --test-dir build-headless --output-on-failure
+```
+
+The projection regression scores the cell-scaled backward-difference
+divergence used by the solver over interior cells (the outer ring contains
+boundary/ghost values). The pressure solve uses over-relaxation and a direct
+Poisson-residual stopping criterion (up to 2048 sweeps) targeting `0.010`.
+A smooth radial field and maximum-rate 3×3 mouse impulses at the center,
+walls, corners, and an oblique near-corner case must all finish below the test
+ceiling of `0.020`; each source-shaped field must also lose at least 95% of its
+initial divergence. A domain-wide velocity-10 flow additionally verifies that
+the paired high-side boundary faces converge and produce zero net flux after
+projection. Failure to reach the target within the safety cap is reported as
+a runtime error rather than silently accepting an unconverged field.
+
+### Sanitizers
+
+Clang and GCC builds can enable AddressSanitizer and
+UndefinedBehaviorSanitizer for both the application and tests:
+
+```bash
+cmake -S . -B build-sanitize \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DFLUIDSIM_ENABLE_SANITIZERS=ON
+cmake --build build-sanitize --parallel
+ctest --test-dir build-sanitize --output-on-failure
 ```
 
 ## Usage
@@ -139,7 +195,8 @@ Press number keys to switch between different visualization modes:
 
 - **1 - Density**: Standard dye visualization (black → blue → cyan → yellow → white)
 - **2 - Divergence**: Shows velocity field divergence (should be near black/zero)
-  - White areas indicate divergence (fluid expanding)
+  - Blue = negative divergence
+  - Red = positive divergence
   - Black areas indicate divergence-free flow (incompressible)
 - **3 - Vorticity**: Shows rotation/swirling patterns in the flow
   - Blue = clockwise rotation
@@ -154,17 +211,31 @@ Press number keys to switch between different visualization modes:
 Modify constants in `FluidSim.h`:
 
 ```cpp
-#define GRID_SIZE 128        // Grid resolution (128×128)
-#define ITER 4               // Solver iterations
-#define DIFFUSION 0.0f       // Diffusion rate
-#define VISCOSITY 0.0000001f // Fluid viscosity
+constexpr int GRID_SIZE = 128;             // Grid resolution (128×128)
+constexpr int DIFFUSION_SOLVER_ITERATIONS = 4;
+constexpr int PRESSURE_SOLVER_MAX_ITERATIONS = 2048;
+constexpr float PROJECTION_DIVERGENCE_TOLERANCE = 0.01f;
+constexpr float DIFFUSION = 0.0f;          // Diffusion rate
+constexpr float VISCOSITY = 0.0000001f;    // Fluid viscosity
+constexpr float DENSITY_FADE_RATE = 0.12f; // Density units per second
 ```
+
+Density is maintained in the normalized range `[0, 1]`. Mouse sources and
+fading are rates per second, and simulation timesteps are capped at 50 ms to
+avoid large jumps after a pause. The 3×3 density brush injects `1.0` density
+unit per second into neighboring cells and `3.0` units per second at its
+center; the center saturates at the normalized upper bound. Pointer motion is
+normalized by logical window size, coupled at `5.0`, and limited to 10 window
+lengths per second; together with the 50 ms timestep cap this bounds a single
+frame's velocity impulse at `2.5`.
 
 ### Performance Tuning
 
 - **Higher GRID_SIZE**: More detailed simulation, lower FPS
 - **Lower GRID_SIZE**: Faster simulation, less detail
-- **ITER**: More iterations = more accurate but slower
+- **PRESSURE_SOLVER_MAX_ITERATIONS**: Upper bound for difficult pressure solves
+- **PROJECTION_DIVERGENCE_TOLERANCE**: Target cell-scaled residual divergence
+- **DIFFUSION_SOLVER_ITERATIONS**: More iterations improve diffusion accuracy
 - **VISCOSITY**: Higher values = "thicker" fluid
 
 ## Code Overview
@@ -178,8 +249,9 @@ class FluidSim {
 public:
     void step(float dt);            // Advance simulation by one timestep
     void addDensity(int x, int y, float amount);
+    void addDensityRate(int x, int y, float amountPerSecond, float dt);
     void addVelocity(int x, int y, float dx, float dy);
-    void fadeDensity();             // Gradually reduce density over time
+    void fadeDensity(float dt);     // Time-based density reduction
     
 private:
     void diffuse(...);              // Diffusion step
@@ -212,14 +284,15 @@ private:
 ### Main Application (`main.cpp`)
 
 - Window creation and OpenGL context setup
-- Input handling (mouse callbacks)
+- Input-state callbacks and timestep-based source application
+- Separate logical-window and framebuffer dimensions for HiDPI displays
 - Dynamic timestep calculation based on frame time
 - Main render loop
 - FPS counter
 
 ## Rendering Pipeline
 
-1. **Field to Texture**: Upload fluid field data (density, divergence, or vorticity) to GPU as a 2D texture
+1. **Field to Texture**: Validate exact texture size, keep density in `[0, 1]`, and symmetrically normalize signed fields to `[-1, 1]`
 2. **Vertex Shader**: Draw full-screen quad
 3. **Fragment Shader**: Map field values to colors using mode-specific gradients
 
@@ -233,7 +306,8 @@ private:
 
 **Divergence Mode:**
 - Black = divergence-free (incompressible flow)
-- White = high divergence
+- Blue = negative divergence
+- Red = positive divergence
 
 **Vorticity Mode:**
 - Blue = clockwise rotation
@@ -260,7 +334,7 @@ Based on Jos Stam's "Stable Fluids" paper (SIGGRAPH 1999):
 ### Numerical Methods
 
 - **Semi-Lagrangian Advection**: Backtrace particles and use bilinear interpolation
-- **Gauss-Seidel Relaxation**: Iterative solver for diffusion and pressure
+- **Gauss-Seidel/SOR Relaxation**: Iterative diffusion and pressure solves
 - **Hodge Decomposition**: Split velocity into divergence-free and gradient components
 
 ## Performance
@@ -321,7 +395,7 @@ Possible improvements:
 
 **Low FPS**
 - Reduce GRID_SIZE
-- Lower ITER count
+- Lower solver iteration counts, while retaining the tested divergence tolerance
 - Close other GPU-intensive applications
 
 **Segmentation fault**

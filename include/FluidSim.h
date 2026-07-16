@@ -5,10 +5,21 @@
 #include <cassert>
 
 // Grid configuration constants
-#define GRID_SIZE 128
-#define ITER 4
-#define DIFFUSION 0.0f
-#define VISCOSITY 0.0000001f
+constexpr int GRID_SIZE = 128;
+constexpr int DIFFUSION_SOLVER_ITERATIONS = 4;
+constexpr int PRESSURE_SOLVER_MAX_ITERATIONS = 2048;
+constexpr float PRESSURE_RELAXATION = 1.9f;
+constexpr float PROJECTION_DIVERGENCE_TOLERANCE = 0.01f;
+constexpr float DIFFUSION = 0.0f;
+constexpr float VISCOSITY = 0.0000001f;
+
+// Simulation values use seconds and a normalized density range of [0, 1].
+constexpr float MAX_SIMULATION_TIMESTEP = 0.05f;
+constexpr float MIN_DENSITY = 0.0f;
+constexpr float MAX_DENSITY = 1.0f;
+constexpr float DENSITY_FADE_RATE = 0.12f;       // Density units per second.
+constexpr float DENSITY_INJECTION_RATE = 1.0f;  // Density units per second.
+constexpr float CENTER_DENSITY_RATE_SCALE = 3.0f;
 
 /**
  * FluidSim implements Jos Stam's Stable Fluids algorithm for 2D incompressible flow.
@@ -17,7 +28,7 @@
  * - Eulerian grid-based simulation
  * - Semi-Lagrangian advection (stable for large timesteps)
  * - Helmholtz-Hodge decomposition for velocity projection
- * - Gauss-Seidel relaxation for implicit diffusion and Poisson solve
+ * - Gauss-Seidel/SOR relaxation for implicit diffusion and pressure solves
  */
 class FluidSim {
 private:
@@ -53,7 +64,7 @@ private:
     
     /**
      * Diffusion step - spreads density/velocity via implicit method.
-     * Uses Gauss-Seidel iteration to solve the linear system.
+     * Uses iterative relaxation to solve the linear system.
      * 
      * Why implicit? Explicit diffusion is unstable for large dt.
      * Implicit method: (I - dt*diff*Laplacian) * x = x0
@@ -71,7 +82,10 @@ private:
      * 
      * This enforces incompressibility (∇·V = 0), a key property of fluids.
      */
-    void project(float dt);
+    void project(std::vector<float>& velocityX,
+                 std::vector<float>& velocityY,
+                 std::vector<float>& pressureField,
+                 std::vector<float>& divergenceField);
     
     /**
      * Advection step - moves quantities along the velocity field.
@@ -90,27 +104,32 @@ private:
     /**
      * Boundary conditions handler.
      * b=0: continuous (density, pressure)
-     * b=1: horizontal walls (Vx=0)
-     * b=2: vertical walls (Vy=0)
+     * b=1: zero X velocity at left/right boundary samples
+     * b=2: zero Y velocity at bottom/top boundary samples
      */
     void set_bnd(int b, std::vector<float>& x);
     
     /**
-     * Linear solver using Gauss-Seidel relaxation.
+     * Linear solver using Gauss-Seidel or successive over-relaxation.
      * Solves: x = (x0 + a*(neighbors)) / c
      * 
      * Used for both diffusion (implicit solve) and projection (Poisson solve).
-     * Gauss-Seidel converges slowly but is simple and cache-friendly.
+     * Updated values are consumed immediately for cache-friendly convergence.
      */
-    void lin_solve(int b, std::vector<float>& x, const std::vector<float>& x0, 
-                   float a, float c);
+    bool lin_solve(int b, std::vector<float>& x,
+                   const std::vector<float>& x0,
+                   float a, float c, int maxIterations, float relaxation,
+                   float residualTolerance = 0.0f);
     
     /**
      * Compute divergence of velocity field.
      * div(V) = ∂Vx/∂x + ∂Vy/∂y
+     * Uses the backward difference paired with projection's forward gradient.
      * Used for visualization and projection.
      */
-    void computeDivergence();
+    void computeDivergence(const std::vector<float>& velocityX,
+                           const std::vector<float>& velocityY,
+                           std::vector<float>& output);
     
     /**
      * Compute scalar vorticity (curl magnitude).
@@ -129,11 +148,20 @@ public:
      * Timestep in seconds (computed from frame time)
      */
     void step(float dt);
+
+    /**
+     * Convert an external timestep to the timestep used by the simulation.
+     * Negative/non-finite values become zero and long frames are capped.
+     */
+    static float sanitizeTimestep(float dt);
     
     // Interaction methods
     void addDensity(int x, int y, float amount);
+    void addDensityRate(int x, int y, float amountPerSecond, float dt);
     void addVelocity(int x, int y, float amountX, float amountY);
-    void fadeDensity();
+    void addVelocityRate(int x, int y, float amountXPerSecond,
+                         float amountYPerSecond, float dt);
+    void fadeDensity(float dt);
     
     // Getters for visualization
     const std::vector<float>& getDensity() const { return density; }
